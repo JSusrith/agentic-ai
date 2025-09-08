@@ -3,11 +3,12 @@ import os
 import datetime as dt
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy import (
     create_engine, Column, Integer, String, Date, Time, DateTime,
-    ForeignKey, UniqueConstraint, inspect, text
+    ForeignKey, UniqueConstraint, inspect, text, or_
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
@@ -104,7 +105,7 @@ def seed_doctors():
             # Orthopedics
             Doctor(name="Dr. Varun Iyer", gender="M", department="Orthopedics",
                    days="Wed,Sat", start_time="10:00", end_time="13:00", slot_minutes=15),
-            # Dentist
+            # Dentistry
             Doctor(name="Dr. Priya Menon", gender="F", department="Dentistry",
                    days="Tue,Thu,Sat", start_time="10:00", end_time="13:00", slot_minutes=15),
             # Neurology
@@ -192,8 +193,22 @@ class CancelIn(BaseModel):
     appointment_id: int
 
 # ---------------- APP ----------------
-app = FastAPI(title="A1 Hospital Booking API", version="1.1")
+app = FastAPI(title="A1 Hospital Booking API", version="1.2")
 
+# CORS (allow all origins; tighten in production if needed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # set to your domain(s) in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"ok": True, "time": dt.datetime.utcnow().isoformat()}
+
+# -------- DOCTORS --------
 @app.get("/doctors", response_model=List[DoctorOut])
 def list_doctors(department: Optional[str] = None, db: Session = Depends(get_db)):
     q = db.query(Doctor)
@@ -204,6 +219,7 @@ def list_doctors(department: Optional[str] = None, db: Session = Depends(get_db)
         "days": d.days, "start_time": d.start_time, "end_time": d.end_time, "slot_minutes": d.slot_minutes
     }) for d in q.all()]
 
+# -------- PATIENTS (CREATE + READ) --------
 @app.post("/patients", response_model=PatientOut)
 def create_patient(body: PatientIn, db: Session = Depends(get_db)):
     p = Patient(**body.dict())
@@ -215,6 +231,39 @@ def create_patient(body: PatientIn, db: Session = Depends(get_db)):
         "age": p.age, "gender": p.gender, "symptoms": p.symptoms, "created_at": p.created_at
     })
 
+@app.get("/patients/{patient_id}", response_model=PatientOut)
+def get_patient(patient_id: int, db: Session = Depends(get_db)):
+    p = db.get(Patient, patient_id)
+    if not p:
+        raise HTTPException(404, "Patient not found")
+    return PatientOut(
+        id=p.id, name=p.name, phone=p.phone, alt_phone=p.alt_phone, email=p.email,
+        age=p.age, gender=p.gender, symptoms=p.symptoms, created_at=p.created_at
+    )
+
+@app.get("/patients")
+def list_patients(q: Optional[str] = None, limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    query = db.query(Patient)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(or_(Patient.name.ilike(like), Patient.phone.ilike(like)))
+    rows = query.order_by(Patient.id.desc()).offset(offset).limit(limit).all()
+    return [
+        {
+            "id": p.id, "name": p.name, "phone": p.phone, "alt_phone": p.alt_phone,
+            "email": p.email, "age": p.age, "gender": p.gender, "created_at": p.created_at
+        }
+        for p in rows
+    ]
+
+@app.get("/patients/lookup")
+def lookup_patient(phone: str = Query(..., description="10-digit phone"), db: Session = Depends(get_db)):
+    p = db.query(Patient).filter(Patient.phone == phone.strip()).first()
+    if not p:
+        raise HTTPException(404, "No patient with that phone")
+    return {"id": p.id, "name": p.name, "phone": p.phone, "email": p.email}
+
+# -------- AVAILABILITY --------
 @app.post("/availability")
 def availability(q: AvailabilityQuery, db: Session = Depends(get_db)):
     date = dt.date.fromisoformat(q.date)
@@ -233,6 +282,7 @@ def availability(q: AvailabilityQuery, db: Session = Depends(get_db)):
         out.append({"doctor_id": d.id, "doctor_name": d.name, "free_slots": free})
     return {"date": q.date, "department": q.department, "availability": out}
 
+# -------- APPOINTMENTS (BOOK / READ / RESCHEDULE / CANCEL) --------
 @app.post("/appointments", response_model=AppointmentOut)
 def book_appointment(body: AppointmentIn, db: Session = Depends(get_db)):
     patient = db.get(Patient, body.patient_id)
@@ -276,6 +326,26 @@ def book_appointment(body: AppointmentIn, db: Session = Depends(get_db)):
         token_no=appt.token_no, status=appt.status, payment_method=appt.payment_method
     )
 
+@app.get("/appointments")
+def list_appointments(patient_id: Optional[int] = None, doctor_id: Optional[int] = None,
+                      date: Optional[str] = None, limit: int = 100, db: Session = Depends(get_db)):
+    q = db.query(Appointment)
+    if patient_id: q = q.filter(Appointment.patient_id == patient_id)
+    if doctor_id: q = q.filter(Appointment.doctor_id == doctor_id)
+    if date: q = q.filter(Appointment.appt_date == dt.date.fromisoformat(date))
+    rows = q.order_by(Appointment.id.desc()).limit(limit).all()
+    return [{
+        "id": a.id,
+        "appointment_code": appt_code(a.id),
+        "patient_id": a.patient_id,
+        "doctor_id": a.doctor_id,
+        "date": a.appt_date.isoformat(),
+        "time": a.appt_time.strftime("%H:%M"),
+        "token_no": a.token_no,
+        "status": a.status,
+        "payment_method": a.payment_method
+    } for a in rows]
+
 @app.get("/appointments/patient/{patient_id}")
 def list_patient_appointments(patient_id: int, db: Session = Depends(get_db)):
     appts = db.query(Appointment).filter(Appointment.patient_id == patient_id).all()
@@ -311,11 +381,7 @@ def reschedule(body: RescheduleIn, db: Session = Depends(get_db)):
         raise HTTPException(404, "Appointment not found")
 
     # allow changing doctor if provided
-    if body.new_doctor_id:
-        doctor = db.get(Doctor, body.new_doctor_id)
-    else:
-        doctor = db.get(Doctor, a.doctor_id)
-
+    doctor = db.get(Doctor, body.new_doctor_id) if body.new_doctor_id else db.get(Doctor, a.doctor_id)
     if not doctor:
         raise HTTPException(404, "Doctor not found")
 
